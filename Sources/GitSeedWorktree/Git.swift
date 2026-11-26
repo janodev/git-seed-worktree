@@ -10,7 +10,13 @@ struct Git {
     }
 
     let directory: String
-    var environment: [String: String] = ProcessInfo.processInfo.environment
+    var environment: [String: String]
+    private var indexedPaths: [Data]?
+
+    init(directory: String, environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.directory = directory
+        self.environment = environment
+    }
 
     func run(_ arguments: [String]) throws {
         _ = try invoke(arguments, capture: false)
@@ -27,21 +33,25 @@ struct Git {
     func independentWorktree(at path: String) throws -> Git {
         var independent = environment
         let keys = try invoke(["rev-parse", "--local-env-vars"], capture: true)
-        for key in String(decoding: keys, as: UTF8.self).split(separator: "\n") {
+        // Carry explicit Git configuration (including `git -c`) to both worktrees.
+        for key in String(decoding: keys, as: UTF8.self).split(separator: "\n")
+        where key != "GIT_CONFIG_PARAMETERS" && key != "GIT_CONFIG_COUNT" {
             independent.removeValue(forKey: String(key))
         }
         return Git(directory: path, environment: independent)
     }
 
-    func isIgnored(_ path: String) throws -> Bool {
+    mutating func isIgnored(_ path: CachePath, caseSensitive: Bool) throws -> Bool {
         do {
             // A leading ./ avoids pathspec magic for names that start with a colon.
             // The trailing slash also matches rules that ignore directories only.
-            try run(["check-ignore", "-q", "--", "./" + path + "/"])
+            try run(["check-ignore", "-q", "--", "./" + path.name + "/"])
         } catch let error as Exit where error.status == 1 {
             return false
         }
-        return try invoke(["--literal-pathspecs", "ls-files", "-z", "--", path + "/"], capture: true).isEmpty
+        let entries = try indexedPaths ?? invoke(["ls-files", "-z"], capture: true).split(separator: 0)
+        indexedPaths = entries
+        return !entries.contains { path.containsIndexedPath($0, caseSensitive: caseSensitive) }
     }
 
     private func invoke(_ arguments: [String], capture: Bool) throws -> Data {

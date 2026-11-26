@@ -69,6 +69,25 @@ struct SeedWorktreeTests {
         #expect(try fixture.stagingEntries().isEmpty)
     }
 
+    @Test(arguments: [true, false])
+    func skipsHookCreatedSymlinksAtOrAboveTheCache(_ linkAtCache: Bool) throws {
+        let fixture = try Fixture()
+        try fixture.write("tools/cache data/value", "seed")
+        let root = fixture.root.appending(path: "outside")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let hook = fixture.repository + "/.git/hooks/post-checkout"
+        let createLink = linkAtCache ? "mkdir tools\nln -s ../../outside 'tools/cache data'" : "ln -s ../outside tools"
+        try ("#!/bin/sh\nset -eu\n" + createLink + "\n").write(toFile: hook, atomically: true, encoding: .utf8)
+        try #require(chmod(hook, 0o700) == 0)
+
+        let result = try fixture.create(caches: ["tools/cache data"])
+
+        let reason = linkAtCache ? "the destination already exists" : "the destination parent must contain real directories"
+        #expect(result.caches.map(\.1) == [.skipped(reason)])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
+        #expect(try fixture.stagingEntries().isEmpty)
+    }
+
     @Test func checksIgnoreRulesAtTheDestinationRevision() throws {
         let fixture = try Fixture()
         try fixture.write(".cache/value", "seed")
@@ -81,17 +100,46 @@ struct SeedWorktreeTests {
         #expect(!fixture.exists(".cache"))
     }
 
-    @Test func skipsACacheWithTrackedFilesInTheSeed() throws {
+    @Test(arguments: [".cache", ".CACHE"])
+    func skipsACacheWithTrackedFilesInTheSeed(_ indexedPath: String) throws {
         let fixture = try Fixture()
-        try fixture.write(".cache/value", "seed")
+        try fixture.write(indexedPath + "/value", "seed")
         let donor = try fixture.git.independentWorktree(at: fixture.seed)
-        try donor.run(["add", "-f", ".cache/value"])
+        try donor.run(["add", "-f", indexedPath + "/value"])
         try donor.run(["commit", "-qm", "Track the seed data"])
+        let pathResolves = FileManager.default.fileExists(atPath: fixture.seed + "/.cache")
 
         let result = try fixture.create(caches: [".cache"])
 
-        #expect(result.caches.map(\.1) == [.skipped("the cache path must be ignored in both worktrees")])
+        let reason = pathResolves ? "the cache path must be ignored in both worktrees" : "the seed directory is absent"
+        #expect(result.caches.map(\.1) == [.skipped(reason)])
         #expect(!fixture.exists(".cache"))
+    }
+
+    @Test func usesInvocationGitConfigurationInBothWorktrees() throws {
+        let fixture = try Fixture()
+        try fixture.write("additional/value", "seed")
+        let excludes = fixture.root.appending(path: "excludes")
+        try "/additional/\n".write(to: excludes, atomically: true, encoding: .utf8)
+        var invokingGit = fixture.git
+        invokingGit.environment["GIT_CONFIG_COUNT"] = "1"
+        invokingGit.environment["GIT_CONFIG_KEY_0"] = "core.excludesFile"
+        invokingGit.environment["GIT_CONFIG_VALUE_0"] = excludes.path
+
+        let result = try fixture.create(caches: ["additional"], using: invokingGit)
+
+        #expect(result.caches.map(\.1) == [.cloned])
+        #expect(try fixture.read("additional/value") == "seed")
+    }
+
+    @Test func comparesCanonicalUnicodeAndRespectsVolumeCaseSensitivity() throws {
+        let cache = try CachePath("Café")
+        let decomposed = Data("Cafe\u{0301}/tracked".utf8)
+        let lowercased = Data("cafe\u{0301}/tracked".utf8)
+        #expect(cache.containsIndexedPath(decomposed, caseSensitive: true))
+        #expect(cache.containsIndexedPath(lowercased, caseSensitive: false))
+        #expect(!cache.containsIndexedPath(lowercased, caseSensitive: true))
+        #expect(!cache.containsIndexedPath(Data("Cafés/tracked".utf8), caseSensitive: false))
     }
 
     @Test func rejectsAForeignSeedBeforeCreatingTheWorktree() throws {
@@ -152,10 +200,11 @@ private final class Fixture {
 
     deinit { try? FileManager.default.removeItem(at: root) }
 
-    func create(caches: [String], seed seedOverride: String? = nil) throws -> (path: String, caches: [(String, CacheOutcome)]) {
+    func create(caches: [String], seed seedOverride: String? = nil, using invokingGit: Git? = nil) throws
+        -> (path: String, caches: [(String, CacheOutcome)]) {
         var args = ["-b", "experiment", "../new worktree", "main", "--seed", seedOverride ?? "../seed"]
         for cache in caches { args += ["--cache", cache] }
-        return try SeedWorktree.parse(args).create(using: git)
+        return try SeedWorktree.parse(args).create(using: invokingGit ?? git)
     }
 
     func write(_ relativePath: String, _ content: String) throws {

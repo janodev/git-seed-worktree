@@ -16,9 +16,9 @@ struct CacheSeeder {
     let donor: String
     let destination: String
 
-    func transfer(_ path: CachePath) -> CacheOutcome {
+    func transfer(_ path: CachePath, ifEligible: () throws -> Bool) -> CacheOutcome {
         do {
-            return try clone(path)
+            return try clone(path, ifEligible: ifEligible)
         } catch let error as FileError where error.code == ENOTSUP || error.code == EXDEV {
             return .skipped("the source and destination cannot share disk blocks")
         } catch let error as IneligibleCache {
@@ -28,9 +28,15 @@ struct CacheSeeder {
         }
     }
 
-    private func clone(_ path: CachePath) throws -> CacheOutcome {
+    private func clone(_ path: CachePath, ifEligible: () throws -> Bool) throws -> CacheOutcome {
         let donorRoot = try Directory(path: donor)
         let destinationRoot = try Directory(path: destination)
+
+        // Check physical paths before asking Git about the checkout. Git rejects
+        // an ignore query that crosses a symlink, including one made by a hook.
+        if let parent = try destinationRoot.cacheParent(for: path), try parent.contains(path.leaf) {
+            return .skipped("the destination already exists")
+        }
         let source: Directory
         do {
             source = try path.components.reduce(donorRoot) { parent, name in try parent.open(name) }
@@ -39,9 +45,10 @@ struct CacheSeeder {
         } catch let error as FileError where error.code == ENOTDIR || error.code == ELOOP {
             return .skipped("the seed path must contain real directories")
         }
+        guard try ifEligible() else { return .skipped("the cache path must be ignored in both worktrees") }
 
         let device = try source.status().st_dev
-        guard try destinationRoot.status().st_dev == device else {
+        guard try donorRoot.status().st_dev == device, try destinationRoot.status().st_dev == device else {
             throw FileError("clone across volumes", code: EXDEV)
         }
 
@@ -71,8 +78,7 @@ struct CacheSeeder {
         } catch let error as FileError where error.code == ENOTDIR || error.code == ELOOP {
             return .skipped("the destination parent must contain real directories")
         }
-        let name = path.components[path.components.count - 1]
-        guard renameatx_np(staging.fd, "cache", parent.fd, name, UInt32(RENAME_EXCL)) == 0 else {
+        guard renameatx_np(staging.fd, "cache", parent.fd, path.leaf, UInt32(RENAME_EXCL)) == 0 else {
             if errno == EEXIST { return .skipped("the destination already exists") }
             throw FileError("publish cache \(path.name)")
         }
@@ -172,6 +178,23 @@ private final class Directory {
             }
             return try open(name)
         }
+    }
+
+    func cacheParent(for path: CachePath) throws -> Directory? {
+        do {
+            return try path.components.dropLast().reduce(self) { parent, name in try parent.open(name) }
+        } catch let error as FileError where error.code == ENOENT {
+            return nil
+        } catch let error as FileError where error.code == ENOTDIR || error.code == ELOOP {
+            throw IneligibleCache("the destination parent must contain real directories")
+        }
+    }
+
+    func contains(_ name: String) throws -> Bool {
+        var info = stat()
+        if fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 { return true }
+        guard errno == ENOENT else { throw FileError("inspect destination \(name)") }
+        return false
     }
 
     func status() throws -> stat {

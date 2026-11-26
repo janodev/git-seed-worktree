@@ -48,14 +48,9 @@ struct SeedWorktree: ParsableCommand {
         guard !path.isEmpty, !seed.isEmpty else { throw ValidationError("Provide a worktree path and a seed path.") }
         guard !cache.isEmpty else { throw ValidationError("Provide at least one --cache directory.") }
         let paths = try cache.map(CachePath.init)
-        for (index, path) in paths.enumerated() {
-            guard !paths[..<index].contains(where: { $0.overlaps(path) }) else {
-                throw ValidationError("Cache directories must be distinct and cannot contain one another: \(path.name)")
-            }
-        }
 
         let donorPath = absolute(seed, relativeTo: git.directory)
-        let donor = try git.independentWorktree(at: donorPath)
+        var donor = try git.independentWorktree(at: donorPath)
         let donorRoot = try donor.path(["rev-parse", "--show-toplevel"])
         let originalCommon = try git.path(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         let donorCommon = try donor.path(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -63,10 +58,13 @@ struct SeedWorktree: ParsableCommand {
               try FileIdentity(originalCommon) == FileIdentity(donorCommon) else {
             throw ValidationError("--seed must be a worktree root from this Git repository.")
         }
+        let donorCaseSensitive = try volumeIsCaseSensitive(at: donorRoot)
+        for (index, path) in paths.enumerated() {
+            guard !paths[..<index].contains(where: { $0.overlaps(path, caseSensitive: donorCaseSensitive) }) else {
+                throw ValidationError("Cache directories must be distinct and cannot contain one another: \(path.name)")
+            }
+        }
 
-        // Check the donor before Git modifies the repository. The destination
-        // ignore rules are checked separately after Git selects its revision.
-        let eligible = try paths.map { try donor.isIgnored($0.name) }
         var arguments = ["worktree", "add"]
         if let branch { arguments += ["-b", branch] }
         arguments += ["--", path]
@@ -74,20 +72,14 @@ struct SeedWorktree: ParsableCommand {
         try git.run(arguments)
 
         let destinationPath = absolute(path, relativeTo: git.directory)
-        let destination = try git.independentWorktree(at: destinationPath)
+        var destination = try git.independentWorktree(at: destinationPath)
+        let destinationCaseSensitive = try volumeIsCaseSensitive(at: destinationPath)
         let seeder = CacheSeeder(donor: donorRoot, destination: destinationPath)
-        let outcomes = zip(paths, eligible).map { path, donorIgnores in
-            let outcome: CacheOutcome
-            do {
-                if donorIgnores, try destination.isIgnored(path.name) {
-                    outcome = seeder.transfer(path)
-                } else {
-                    outcome = .skipped("the cache path must be ignored in both worktrees")
-                }
-            } catch {
-                outcome = .failed(String(describing: error))
-            }
-            return (path.name, outcome)
+        let outcomes = paths.map { path in
+            (path.name, seeder.transfer(path) {
+                try donor.isIgnored(path, caseSensitive: donorCaseSensitive) &&
+                    destination.isIgnored(path, caseSensitive: destinationCaseSensitive)
+            })
         }
         return (destinationPath, outcomes)
     }
@@ -98,9 +90,18 @@ private func absolute(_ path: String, relativeTo directory: String) -> String {
     return URL(fileURLWithPath: absolutePath).resolvingSymlinksInPath().path
 }
 
+private func volumeIsCaseSensitive(at path: String) throws -> Bool {
+    let directory = URL(fileURLWithPath: path, isDirectory: true)
+    return try directory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+        .volumeSupportsCaseSensitiveNames ?? false
+}
+
 struct CachePath {
     let name: String
     let components: [String]
+    private let comparisonComponents: [String]
+
+    var leaf: String { components[components.count - 1] }
 
     init(_ name: String) throws {
         let components = name.components(separatedBy: "/")
@@ -110,9 +111,28 @@ struct CachePath {
         }
         self.name = name
         self.components = components
+        comparisonComponents = components.map(Self.comparisonKey)
     }
 
-    func overlaps(_ other: Self) -> Bool {
-        components.starts(with: other.components) || other.components.starts(with: components)
+    func overlaps(_ other: Self, caseSensitive: Bool) -> Bool {
+        let first = caseSensitive ? components : comparisonComponents
+        let second = caseSensitive ? other.components : other.comparisonComponents
+        return first.starts(with: second) || second.starts(with: first)
+    }
+
+    func containsIndexedPath(_ rawPath: Data, caseSensitive: Bool) -> Bool {
+        let prefix = rawPath.split(separator: 0x2F, maxSplits: components.count)
+        guard prefix.count >= components.count else { return false }
+        let keys = caseSensitive ? components : comparisonComponents
+        return zip(prefix, keys).allSatisfy { bytes, key in
+            let component = String(decoding: bytes, as: UTF8.self)
+            return (caseSensitive ? component : Self.comparisonKey(component)) == key
+        }
+    }
+
+    private static func comparisonKey(_ component: String) -> String {
+        // Treat case and canonical Unicode aliases conservatively, including
+        // when examining a Git index that was authored on another filesystem.
+        component.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
     }
 }
