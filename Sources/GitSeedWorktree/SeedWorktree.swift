@@ -5,7 +5,7 @@ import Foundation
 struct SeedWorktree: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "git-seed-worktree",
-        abstract: "Create a Git worktree and clone selected caches from another checkout."
+        abstract: "Create a Git worktree with copy-on-write files from another checkout."
     )
 
     @Option(name: [.customShort("b"), .long], help: "Create a branch at the selected commit.")
@@ -20,6 +20,9 @@ struct SeedWorktree: ParsableCommand {
     @Option(help: "Root of a finished checkout of the same repository.")
     var seed: String
 
+    @Flag(help: "Clone matching tracked files from the seed on APFS.")
+    var cloneTracked = false
+
     @Option(parsing: .singleValue, help: "Ignored cache directory relative to each worktree. Repeat to seed several.")
     var cache: [String] = []
 
@@ -28,6 +31,14 @@ struct SeedWorktree: ParsableCommand {
         do {
             let result = try create(using: git)
             print("Worktree: \(result.path)")
+            switch result.tracked {
+            case .finished(let cloned, let checkedOut):
+                print("Tracked files: cloned \(cloned), checked out by Git \(checkedOut)")
+            case .standard(let reason):
+                print("Tracked files: standard Git checkout (\(reason))")
+            case nil:
+                break
+            }
             for (cache, outcome) in result.caches {
                 switch outcome {
                 case .cloned:
@@ -39,14 +50,17 @@ struct SeedWorktree: ParsableCommand {
                 }
             }
             if result.caches.contains(where: { $0.1.failed }) { throw ExitCode.failure }
+        } catch let error as TrackedCheckoutFailure {
+            FileHandle.standardError.write(Data((error.description + "\n").utf8))
+            throw ExitCode((error.cause as? Git.Exit)?.status ?? 1)
         } catch let error as Git.Exit {
             throw ExitCode(error.status)
         }
     }
 
-    func create(using git: Git) throws -> (path: String, caches: [(String, CacheOutcome)]) {
+    func create(using git: Git) throws -> SeededWorktree {
         guard !path.isEmpty, !seed.isEmpty else { throw ValidationError("Provide a worktree path and a seed path.") }
-        guard !cache.isEmpty else { throw ValidationError("Provide at least one --cache directory.") }
+        guard cloneTracked || !cache.isEmpty else { throw ValidationError("Provide --clone-tracked or at least one --cache directory.") }
         let paths = try cache.map(CachePath.init)
 
         let donorPath = absolute(seed, relativeTo: git.directory)
@@ -65,7 +79,10 @@ struct SeedWorktree: ParsableCommand {
             }
         }
 
+        let standardReason = try cloneTracked ? TrackedCheckout.standardCheckoutReason(invokedFrom: git, seed: donor) : nil
+        let seedTrackedFiles = cloneTracked && standardReason == nil
         var arguments = ["worktree", "add"]
+        if seedTrackedFiles { arguments.append("--no-checkout") }
         if let branch { arguments += ["-b", branch] }
         arguments += ["--", path]
         if let start { arguments.append(start) }
@@ -73,6 +90,10 @@ struct SeedWorktree: ParsableCommand {
 
         let destinationPath = absolute(path, relativeTo: git.directory)
         var destination = try git.independentWorktree(at: destinationPath)
+        var tracked = standardReason.map(TrackedCheckoutOutcome.standard)
+        if seedTrackedFiles {
+            tracked = try TrackedCheckout(donor: donor, destination: destination).finish()
+        }
         let destinationCaseSensitive = try volumeIsCaseSensitive(at: destinationPath)
         let seeder = CacheSeeder(donor: donorRoot, destination: destinationPath)
         let outcomes = paths.map { path in
@@ -81,8 +102,14 @@ struct SeedWorktree: ParsableCommand {
                     destination.isIgnored(path, caseSensitive: destinationCaseSensitive)
             })
         }
-        return (destinationPath, outcomes)
+        return SeededWorktree(path: destinationPath, tracked: tracked, caches: outcomes)
     }
+}
+
+struct SeededWorktree {
+    let path: String
+    let tracked: TrackedCheckoutOutcome?
+    let caches: [(String, CacheOutcome)]
 }
 
 private func absolute(_ path: String, relativeTo directory: String) -> String {
@@ -104,9 +131,7 @@ struct CachePath {
     var leaf: String { components[components.count - 1] }
 
     init(_ name: String) throws {
-        let components = name.components(separatedBy: "/")
-        guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." &&
-            $0.lowercased() != ".git" && !$0.utf8.contains(0) }) else {
+        guard let components = worktreePathComponents(name) else {
             throw ValidationError("Expected a worktree-relative cache directory: \(name)")
         }
         self.name = name
@@ -135,4 +160,11 @@ struct CachePath {
         // when examining a Git index that was authored on another filesystem.
         component.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
     }
+}
+
+func worktreePathComponents(_ name: String) -> [String]? {
+    let components = name.components(separatedBy: "/")
+    guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." &&
+        $0.lowercased() != ".git" && !$0.utf8.contains(0) }) else { return nil }
+    return components
 }

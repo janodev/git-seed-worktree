@@ -5,6 +5,100 @@ import Testing
 @testable import GitSeedWorktree
 
 struct SeedWorktreeTests {
+    @Test func clonesCommittedFilesAndLetsGitReconcileBranchesAndSubmodules() throws {
+        let fixture = try Fixture()
+        func writeTracked(_ name: String, _ content: String) throws {
+            try content.write(toFile: fixture.repository + "/" + name, atomically: true, encoding: .utf8)
+        }
+        try writeTracked("changed.txt", "old")
+        try writeTracked("dirty.txt", "committed seed value")
+        try writeTracked("removed.txt", "seed only")
+        try writeTracked("run.sh", "#!/bin/sh\n")
+        try #require(chmod(fixture.repository + "/run.sh", 0o755) == 0)
+        try fixture.git.run(["add", "changed.txt", "dirty.txt", "removed.txt", "run.sh"])
+        let base = try fixture.git.path(["rev-parse", "HEAD"])
+        try fixture.git.run(["update-index", "--add", "--cacheinfo", "160000,\(base),module"])
+        try fixture.git.run(["commit", "-qm", "Add a branch comparison fixture"])
+        let donor = try fixture.git.independentWorktree(at: fixture.seed)
+        try donor.run(["checkout", "-q", "--detach", "main"])
+        try donor.run(["update-index", "--assume-unchanged", "dirty.txt"])
+        try fixture.write("dirty.txt", "uncommitted seed value")
+        try fixture.write("module/local", "uncommitted module data")
+        try fixture.write("untracked", "local seed data")
+        try writeTracked("changed.txt", "new")
+        try writeTracked("new.txt", "target only")
+        try fixture.git.run(["add", "changed.txt", "new.txt"])
+        try fixture.git.run(["rm", "-q", "removed.txt"])
+        try fixture.git.run(["commit", "-qm", "Advance the target branch"])
+
+        let hook = fixture.repository + "/.git/hooks/post-checkout"
+        try """
+        #!/bin/sh
+        set -eu
+        test "$(cat changed.txt)" = new
+        printf '%s\\n' "$@" >> hook-args
+        """.write(toFile: hook, atomically: true, encoding: .utf8)
+        try #require(chmod(hook, 0o700) == 0)
+
+        let result = try fixture.create(cloneTracked: true)
+
+        #expect(result.tracked == .finished(cloned: 3, checkedOut: 4))
+        #expect(try fixture.read("changed.txt") == "new")
+        #expect(try fixture.read("dirty.txt") == "committed seed value")
+        #expect(try fixture.read("new.txt") == "target only")
+        #expect(!fixture.exists("removed.txt"))
+        #expect(!fixture.exists("untracked"))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.url("module").path).isEmpty)
+        #expect(FileManager.default.isExecutableFile(atPath: fixture.url("run.sh").path))
+        #expect(try FileIdentity(fixture.seed + "/tracked.txt") != FileIdentity(fixture.url("tracked.txt").path))
+        #expect(try String(contentsOfFile: fixture.seed + "/dirty.txt", encoding: .utf8) == "uncommitted seed value")
+        let head = try fixture.git.path(["rev-parse", "HEAD"])
+        #expect(try fixture.read("hook-args") == String(repeating: "0", count: head.count) + "\n\(head)\n1\n")
+        let destination = try fixture.git.independentWorktree(at: fixture.destination)
+        #expect(try destination.capture(["status", "--porcelain", "--untracked-files=no"]).isEmpty)
+        #expect(try fixture.stagingEntries().isEmpty)
+    }
+
+    @Test func sendsTransformedFilesThroughGitEvenWhenTheSeedMatchesTheRawBlob() throws {
+        let fixture = try Fixture()
+        try "converted.txt text eol=crlf\n".write(toFile: fixture.repository + "/.gitattributes",
+                                                 atomically: true, encoding: .utf8)
+        try "committed\n".write(toFile: fixture.repository + "/converted.txt", atomically: true, encoding: .utf8)
+        try fixture.git.run(["add", ".gitattributes", "converted.txt"])
+        try fixture.git.run(["commit", "-qm", "Require checkout conversion"])
+        let donor = try fixture.git.independentWorktree(at: fixture.seed)
+        try donor.run(["checkout", "-q", "--detach", "main"])
+        try fixture.write("converted.txt", "committed\n")
+
+        let result = try fixture.create(cloneTracked: true)
+
+        #expect(result.tracked == .finished(cloned: 3, checkedOut: 1))
+        #expect(try fixture.read("converted.txt") == "committed\r\n")
+    }
+
+    @Test func usesAStandardWorktreeCheckoutForAutomaticLineEndingConversion() throws {
+        let fixture = try Fixture()
+        try fixture.git.run(["config", "core.autocrlf", "true"])
+
+        let result = try fixture.create(cloneTracked: true)
+
+        #expect(result.tracked == .standard("core.autocrlf uses Git's standard checkout"))
+        #expect(try fixture.read("tracked.txt") == "committed")
+    }
+
+    @Test func preservesAFailedPostCheckoutHooksExitStatus() throws {
+        let fixture = try Fixture()
+        let hook = fixture.repository + "/.git/hooks/post-checkout"
+        try "#!/bin/sh\nexit 42\n".write(toFile: hook, atomically: true, encoding: .utf8)
+        try #require(chmod(hook, 0o700) == 0)
+
+        let error = #expect(throws: TrackedCheckoutFailure.self) { try fixture.create(cloneTracked: true) }
+
+        #expect((error?.cause as? Git.Exit)?.status == 42)
+        #expect(try fixture.read("tracked.txt") == "committed")
+        #expect(try fixture.stagingEntries().isEmpty)
+    }
+
     @Test func clonesOnlySelectedCachesAndKeepsWritesIndependent() throws {
         let fixture = try Fixture()
         try fixture.write(".cache/nested/value", "seed")
@@ -200,9 +294,10 @@ private final class Fixture {
 
     deinit { try? FileManager.default.removeItem(at: root) }
 
-    func create(caches: [String], seed seedOverride: String? = nil, using invokingGit: Git? = nil) throws
-        -> (path: String, caches: [(String, CacheOutcome)]) {
+    func create(caches: [String] = [], seed seedOverride: String? = nil, using invokingGit: Git? = nil,
+                cloneTracked: Bool = false) throws -> SeededWorktree {
         var args = ["-b", "experiment", "../new worktree", "main", "--seed", seedOverride ?? "../seed"]
+        if cloneTracked { args.append("--clone-tracked") }
         for cache in caches { args += ["--cache", cache] }
         return try SeedWorktree.parse(args).create(using: invokingGit ?? git)
     }

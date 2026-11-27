@@ -122,9 +122,7 @@ struct CacheSeeder {
         let file = openat(source.fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard file >= 0 else { throw FileError("open \(path)") }
         defer { _ = close(file) }
-        guard fclonefileat(file, target.fd, name, UInt32(CLONE_NOOWNERCOPY)) == 0 else {
-            throw FileError("clone \(path)")
-        }
+        try target.clone(file, as: name, diagnosticPath: path)
     }
 }
 
@@ -146,7 +144,7 @@ struct FileError: Error, CustomStringConvertible {
     var description: String { "\(operation): \(String(cString: strerror(code)))" }
 }
 
-private final class Directory {
+final class Directory {
     private static let openFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
     let fd: Int32
 
@@ -169,14 +167,20 @@ private final class Directory {
         guard mkdirat(fd, name, 0o700) == 0 else { throw FileError("create directory \(name)") }
     }
 
-    func openOrMake(_ name: String) throws -> Directory {
+    func openOrMake(_ name: String, mode: mode_t = 0o700) throws -> Directory {
         do {
             return try open(name)
         } catch let error as FileError where error.code == ENOENT {
-            guard mkdirat(fd, name, 0o700) == 0 || errno == EEXIST else {
+            guard mkdirat(fd, name, mode) == 0 || errno == EEXIST else {
                 throw FileError("create directory \(name)")
             }
             return try open(name)
+        }
+    }
+
+    func clone(_ sourceFile: Int32, as name: String, diagnosticPath: String) throws {
+        guard fclonefileat(sourceFile, fd, name, UInt32(CLONE_NOOWNERCOPY)) == 0 else {
+            throw FileError("clone \(diagnosticPath)")
         }
     }
 
