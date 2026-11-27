@@ -58,32 +58,25 @@ struct Git {
         return !entries.contains { path.containsIndexedPath($0, caseSensitive: caseSensitive) }
     }
 
-    func runHook(_ name: String, arguments: [String]) throws {
-        // Execute hooks directly without GIT_DIR set (matching git worktree add),
-        // so hooks that inspect other repositories or submodules are not redirected.
-        let hookPath = try path(["rev-parse", "--git-path", "hooks/" + name])
-        let resolved = hookPath.hasPrefix("/") ? hookPath : directory + "/" + hookPath
-        var info = stat()
-        guard stat(resolved, &info) == 0, info.st_mode & S_IFMT == S_IFREG, access(resolved, X_OK) == 0 else {
-            return
+    // Native worktree add discovers hooks in the invoking repository and runs
+    // them in the new checkout. Let Git handle the entire operation in that case.
+    func canSkipPostCheckoutHook() throws -> Bool {
+        do {
+            _ = try invoke(["hook", "list", "-z", "post-checkout"], capture: true, quiet: true)
+            return false
+        } catch let error as Exit {
+            // A missing hook is status 1. If Git cannot list hooks, use native checkout.
+            return error.status == 1
         }
-        let child = Process()
-        child.executableURL = URL(fileURLWithPath: resolved)
-        child.currentDirectoryURL = URL(fileURLWithPath: directory)
-        child.arguments = arguments
-        child.environment = environment
-        child.standardInput = FileHandle.nullDevice
-        try child.run()
-        child.waitUntilExit()
-        let status = child.terminationReason == .exit ? child.terminationStatus : 128 + child.terminationStatus
-        guard status == 0 else { throw Exit(arguments: ["hook", "run", name] + arguments, status: status) }
     }
 
-    private func invoke(_ arguments: [String], capture: Bool, input: Data? = nil) throws -> Data {
+    private func invoke(_ arguments: [String], capture: Bool, input: Data? = nil,
+                        quiet: Bool = false) throws -> Data {
         let child = Process()
         child.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         child.arguments = ["-C", directory] + arguments
         child.environment = environment
+        if quiet { child.standardError = FileHandle.nullDevice }
         let output = capture ? Pipe() : nil
         if let output { child.standardOutput = output }
         let standardInput = try input.map(commandInput)

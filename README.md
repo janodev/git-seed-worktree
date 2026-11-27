@@ -28,7 +28,9 @@ cleanup.
   it. Git checks out changed files, filtered paths, symlinks and submodule
   entries. When cloning is unavailable, Git writes the tracked files. Sparse
   checkout, automatic line-ending conversion, and recursive submodule settings
-  use Git's standard checkout.
+  in the destination use Git's standard checkout. When Git lists a
+  `post-checkout` hook, it creates and checks out the worktree itself. Requested
+  caches are still cloned after the hooks succeed.
 - Repeat `--cache` for each relative cache directory. A cache must be ignored
   and contain no tracked files in either Git index. Choose caches that work
   after relocation. Symlinks must be relative and resolve inside the cache.

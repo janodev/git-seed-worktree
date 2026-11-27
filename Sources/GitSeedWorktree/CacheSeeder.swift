@@ -64,7 +64,7 @@ struct CacheSeeder {
         try staging.make("cache", mode: 0o777)
         let stagedCache = try staging.open("cache")
         var links = [String]()
-        try cloneContents(source, into: stagedCache, device: device, prefix: "", links: &links)
+        try cloneContents(source, into: stagedCache, device: device, links: &links)
         for link in links {
             var status = stat()
             guard fstatat(stagedCache.fd, link, &status, AT_RESOLVE_BENEATH) == 0 else {
@@ -87,10 +87,31 @@ struct CacheSeeder {
         return .cloned
     }
 
-    private func cloneContents(_ source: Directory, into target: Directory, device: dev_t, prefix: String,
+    private func cloneContents(_ sourceRoot: Directory, into targetRoot: Directory, device: dev_t,
                                links: inout [String]) throws {
+        // Queue paths, not directory descriptors. Reopen each component relative
+        // to its pinned root without following symlinks, even if the seed changes.
+        var pending: [[String]] = [[]]
+        while let components = pending.popLast() {
+            let source = try components.reduce(sourceRoot) { parent, name in
+                let child = try parent.open(name)
+                let status = try child.status()
+                guard status.st_dev == device else { throw IneligibleCache("mount point at \(name)") }
+                guard status.st_flags & Self.blockingFlags == 0 else {
+                    throw IneligibleCache("locked item at \(name)")
+                }
+                return child
+            }
+            let target = try components.reduce(targetRoot) { try $0.open($1) }
+            try cloneDirectoryEntries(source, into: target, components: components, device: device,
+                                      pending: &pending, links: &links)
+        }
+    }
+
+    private func cloneDirectoryEntries(_ source: Directory, into target: Directory, components: [String],
+                                       device: dev_t, pending: inout [[String]], links: inout [String]) throws {
         for name in try source.names() {
-            let path = prefix + name
+            let path = (components + [name]).joined(separator: "/")
             guard name.lowercased() != ".git" else { throw IneligibleCache("Git metadata at \(path)") }
             var status = stat()
             guard fstatat(source.fd, name, &status, AT_SYMLINK_NOFOLLOW) == 0 else {
@@ -100,15 +121,8 @@ struct CacheSeeder {
             guard status.st_flags & Self.blockingFlags == 0 else { throw IneligibleCache("locked item at \(path)") }
             switch status.st_mode & S_IFMT {
             case S_IFDIR:
-                let child = try source.open(name)
-                let childStatus = try child.status()
-                guard childStatus.st_dev == device else { throw IneligibleCache("mount point at \(path)") }
-                guard childStatus.st_flags & Self.blockingFlags == 0 else {
-                    throw IneligibleCache("locked item at \(path)")
-                }
                 try target.make(name, mode: 0o777)
-                try cloneContents(child, into: target.open(name), device: device,
-                                  prefix: path + "/", links: &links)
+                pending.append(components + [name])
             case S_IFREG:
                 try cloneFile(name, from: source, into: target, device: device, path: path)
             case S_IFLNK:

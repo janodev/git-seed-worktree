@@ -31,15 +31,6 @@ struct SeedWorktreeTests {
         try fixture.git.run(["rm", "-q", "removed.txt"])
         try fixture.git.run(["commit", "-qm", "Advance the target branch"])
 
-        let hook = fixture.repository + "/.git/hooks/post-checkout"
-        try """
-        #!/bin/sh
-        set -eu
-        test "$(cat changed.txt)" = new
-        printf '%s\\n' "$@" >> hook-args
-        """.write(toFile: hook, atomically: true, encoding: .utf8)
-        try #require(chmod(hook, 0o700) == 0)
-
         let result = try fixture.create(cloneTracked: true)
 
         #expect(result.tracked == .finished(cloned: 3, checkedOut: 4))
@@ -52,8 +43,6 @@ struct SeedWorktreeTests {
         #expect(FileManager.default.isExecutableFile(atPath: fixture.url("run.sh").path))
         #expect(try FileIdentity(fixture.seed + "/tracked.txt") != FileIdentity(fixture.url("tracked.txt").path))
         #expect(try String(contentsOfFile: fixture.seed + "/dirty.txt", encoding: .utf8) == "uncommitted seed value")
-        let head = try fixture.git.path(["rev-parse", "HEAD"])
-        #expect(try fixture.read("hook-args") == String(repeating: "0", count: head.count) + "\n\(head)\n1\n")
         let destination = try fixture.git.independentWorktree(at: fixture.destination)
         #expect(try destination.capture(["status", "--porcelain", "--untracked-files=no"]).isEmpty)
         #expect(try fixture.stagingEntries().isEmpty)
@@ -373,17 +362,12 @@ struct SeedWorktreeTests {
         let donor = try fixture.git.independentWorktree(at: fixture.seed)
         try donor.run(["checkout", "-q", "-f", "--detach", "main"])
 
-        let hook = fixture.repository + "/.git/hooks/post-checkout"
-        try "#!/bin/sh\nprintf ok > hook-ran\n".write(toFile: hook, atomically: true, encoding: .utf8)
-        try #require(chmod(hook, 0o700) == 0)
-
         let nativeDest = fixture.root.path + "/native-wt"
         try fixture.git.run(["worktree", "add", "-q", "-b", "native", nativeDest, "main"])
         let result = try fixture.create(cloneTracked: true)
 
         #expect(result.tracked == .finished(cloned: 3, checkedOut: 8))
         #expect(try fixture.read("clean.txt") == "clean\n")
-        #expect(try fixture.read("hook-ran") == "ok")
         #expect(try FileIdentity(fixture.seed + "/clean.txt") != FileIdentity(fixture.url("clean.txt").path))
         let nativeGit = try fixture.git.independentWorktree(at: nativeDest)
         let seededGit = try fixture.git.independentWorktree(at: fixture.destination)
@@ -421,7 +405,7 @@ struct SeedWorktreeTests {
 
         let result = try fixture.create(cloneTracked: true)
 
-        #expect(result.tracked == .finished(cloned: 2, checkedOut: 1))
+        #expect(result.tracked == .standard("post-checkout hooks use Git's standard checkout"))
         #expect(try fixture.read("own-branch") == "experiment\n")
         #expect(try fixture.read("other-branch") == "other-branch\n")
 
@@ -433,6 +417,73 @@ struct SeedWorktreeTests {
         ]).create(using: fixture.git)
         #expect(disabled.tracked == .finished(cloned: 2, checkedOut: 1))
         #expect(!FileManager.default.fileExists(atPath: disabledDest + "/own-branch"))
+    }
+
+    @Test(arguments: ["worktree", "gitdir", "onbranch"])
+    func usesDestinationConfigurationForCheckout(_ scope: String) throws {
+        let fixture = try Fixture()
+        if scope == "worktree" {
+            try fixture.git.run(["config", "extensions.worktreeConfig", "true"])
+            try fixture.git.run(["config", "--worktree", "core.autocrlf", "true"])
+        } else {
+            let config = fixture.root.appending(path: "checkout.gitconfig")
+            try Data("[core]\n\tautocrlf = true\n".utf8).write(to: config)
+            let condition = scope == "gitdir" ? "gitdir:**/worktrees/**" : "onbranch:exp*"
+            try fixture.git.run(["config", "includeIf." + condition + ".path", config.path])
+        }
+
+        let native = fixture.root.appending(path: "native")
+        try fixture.git.run(["worktree", "add", "-q", "-b", "expected", native.path, "main"])
+        let result = try fixture.create(cloneTracked: true)
+        let expected = try Data(contentsOf: native.appending(path: ".gitignore"))
+        #expect(expected.contains(0x0D))
+        #expect(try Data(contentsOf: fixture.url(".gitignore")) == expected)
+        #expect(result.tracked == .standard("core.autocrlf uses Git's standard checkout"))
+    }
+
+    @Test(arguments: ["sha1", "sha256"], [false, true])
+    func runsConfiguredHooksWithAndWithoutAHookFile(_ format: String, _ hasHookFile: Bool) throws {
+        let fixture = try Fixture(objectFormat: format)
+        let head = try fixture.git.path(["rev-parse", "HEAD"])
+        try fixture.git.run(["config", "hook.setup.event", "post-checkout"])
+        try fixture.git.run(["config", "hook.setup.command", "echo configured >> hook-log; :"])
+        if hasHookFile {
+            let hook = fixture.repository + "/.git/hooks/post-checkout"
+            try Data("""
+                test -z "${GIT_DIR:-}" && test -z "${GIT_WORK_TREE:-}" || exit 8
+                cat tracked.txt >> hook-log
+                printf ' %s\\n' "$@" >> hook-log
+                """.utf8).write(to: URL(fileURLWithPath: hook))
+            try #require(chmod(hook, 0o700) == 0)
+        }
+        try fixture.write(".cache/item", "cached")
+
+        let native = fixture.root.appending(path: "native")
+        try fixture.git.run(["worktree", "add", "-q", "--detach", native.path, "main"])
+        let result = try fixture.create(caches: [".cache"], cloneTracked: true)
+
+        let expected = try String(contentsOf: native.appending(path: "hook-log"), encoding: .utf8)
+        let hookArguments = String(repeating: "0", count: head.count) + "\n \(head)\n 1\n"
+        #expect(expected == (hasHookFile ? "configured\ncommitted " + hookArguments : "configured\n"))
+        #expect(try fixture.read("hook-log") == expected)
+        #expect(result.caches.map(\.1) == [.cloned])
+        #expect(try fixture.read(".cache/item") == "cached")
+    }
+
+    @Test func clonesDeepCachesUnderABoundedDescriptorLimit() throws {
+        let fixture = try Fixture()
+        let leaf = ".cache/" + String(repeating: "d/", count: 145) + "item"
+        try fixture.write(leaf, "deep value")
+        let executable = Bundle(for: Fixture.self).bundleURL
+            .deletingLastPathComponent().appending(path: "git-seed-worktree").path
+        // Limit only the child, including its hard limit. Other tests run concurrently.
+        let result = try runCLI("/bin/sh", in: fixture.repository, environment: fixture.git.environment,
+                                arguments: ["-c", "ulimit -n 256 && exec \"$@\"", "cache-test",
+                                            executable, "-b", "deep", fixture.destination, "main",
+                                            "--seed", fixture.seed, "--cache", ".cache"])
+        try #require(result.status == 0, "\(result.stdout)\n\(result.stderr)")
+        #expect(try fixture.read(leaf) == "deep value")
+        #expect(try fixture.stagingEntries().isEmpty)
     }
 
     @Test func honorsEffectiveGitConfigAndStandardCheckoutFallbacks() throws {
@@ -507,10 +558,6 @@ struct SeedWorktreeTests {
         try donor.run(["checkout", "-q", "--detach", "main"])
         try fixture.write("dirty.txt", "modified in seed")
         try fixture.write(".cache/item", "cached")
-        let hook = fixture.repository + "/.git/hooks/post-checkout"
-        try "#!/bin/sh\nprintf '%s\\n' \"$@\" > hook-args\n".write(toFile: hook, atomically: true, encoding: .utf8)
-        try #require(chmod(hook, 0o700) == 0)
-
         let result = try fixture.create(caches: [".cache"], cloneTracked: true)
 
         #expect(result.tracked == .finished(cloned: 2, checkedOut: 1))
@@ -520,7 +567,6 @@ struct SeedWorktreeTests {
         #expect(try fixture.read(".cache/item") == "cached")
         let head = try fixture.git.path(["rev-parse", "HEAD"])
         #expect(head.count == 64)
-        #expect(try fixture.read("hook-args") == String(repeating: "0", count: 64) + "\n\(head)\n1\n")
         let destination = try fixture.git.independentWorktree(at: fixture.destination)
         #expect(try destination.capture(["status", "--porcelain", "--untracked-files=no"]).isEmpty)
     }

@@ -79,16 +79,27 @@ struct SeedWorktree: ParsableCommand {
             }
         }
 
-        let standardReason = try cloneTracked ? TrackedCheckout.standardCheckoutReason(invokedFrom: git, seed: donor) : nil
+        var standardReason: String?
+        if cloneTracked {
+            if try !git.canSkipPostCheckoutHook() {
+                standardReason = "post-checkout hooks use Git's standard checkout"
+            } else if try !TrackedCheckout.hasDonorCommit(donor) {
+                standardReason = "the seed has no commit"
+            }
+        }
         let seedTrackedFiles = cloneTracked && standardReason == nil
         var arguments = ["worktree", "add"]
         if seedTrackedFiles { arguments.append("--no-checkout") }
         if let branch { arguments += ["-b", branch] }
         arguments += ["--", path]
         if let start { arguments.append(start) }
-        try git.run(arguments)
-
         let destinationPath = absolute(path, relativeTo: git.directory)
+        do {
+            try git.run(arguments)
+        } catch where standardReason != nil {
+            throw TrackedCheckoutFailure(path: destinationPath, cause: error)
+        }
+
         let destinationCaseSensitive = try volumeIsCaseSensitive(at: destinationPath)
         var destination = try git.independentWorktree(at: destinationPath)
         var tracked = standardReason.map(TrackedCheckoutOutcome.standard)

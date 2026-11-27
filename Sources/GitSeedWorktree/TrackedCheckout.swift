@@ -19,38 +19,32 @@ struct TrackedCheckout {
     let destination: Git
     let caseSensitive: Bool
 
-    static func standardCheckoutReason(invokedFrom git: Git, seed donor: Git) throws -> String? {
+    private func standardCheckoutReason() throws -> String? {
         let config: Data
         do {
-            config = try git.capture(["config", "--show-scope", "--null", "--get-regexp",
+            config = try destination.capture(["config", "--null", "--get-regexp",
                 "^(core\\.sparsecheckout|core\\.autocrlf|submodule\\.recurse)$"])
         } catch let error as Git.Exit where error.status == 1 {
-            return try hasDonorCommit(donor) ? nil : "the seed has no commit"
+            return nil
         }
-        guard config.isEmpty || config.last == 0 else { throw MalformedGitOutput(command: "config") }
-        let fields = config.split(separator: 0, omittingEmptySubsequences: false).dropLast()
-        guard fields.count.isMultiple(of: 2) else { throw MalformedGitOutput(command: "config") }
+        guard config.last == 0 else { throw MalformedGitOutput(command: "config") }
         var effective = [String: String]()
-        for i in stride(from: 0, to: fields.count, by: 2) {
-            let scope = String(decoding: fields[i], as: UTF8.self)
-            let entry = String(decoding: fields[i + 1], as: UTF8.self).split(
+        for field in config.split(separator: 0) {
+            let entry = String(decoding: field, as: UTF8.self).split(
                 separator: "\n", maxSplits: 1, omittingEmptySubsequences: false
             )
-            guard let key = entry.first.map(String.init) else { continue }
-            // A new worktree does not inherit the invoking worktree's config.worktree,
-            // except that git worktree add propagates sparse-checkout from it.
-            if scope == "worktree" && key != "core.sparsecheckout" { continue }
-            effective[key] = entry.count == 2 ? entry[1].lowercased() : "true"
+            guard let key = entry.first else { throw MalformedGitOutput(command: "config") }
+            effective[String(key)] = entry.count == 2 ? entry[1].lowercased() : "true"
         }
         for key in ["core.sparsecheckout", "core.autocrlf", "submodule.recurse"] {
             if let value = effective[key], !["", "false", "no", "off", "0"].contains(value) {
                 return "\(key) uses Git's standard checkout"
             }
         }
-        return try hasDonorCommit(donor) ? nil : "the seed has no commit"
+        return nil
     }
 
-    private static func hasDonorCommit(_ donor: Git) throws -> Bool {
+    static func hasDonorCommit(_ donor: Git) throws -> Bool {
         do {
             _ = try donor.capture(["rev-parse", "--verify", "-q", "HEAD^{commit}"])
             return true
@@ -68,6 +62,13 @@ struct TrackedCheckout {
     }
 
     private func materialize() throws -> TrackedCheckoutOutcome {
+        // Read config after Git has copied config.worktree and assigned the new
+        // gitdir and branch, so conditional includes see the actual destination.
+        if let reason = try standardCheckoutReason() {
+            // This is the initial checkout command used by Git's worktree add.
+            try destination.run(["reset", "--hard", "--no-recurse-submodules"])
+            return .standard(reason)
+        }
         let head = try destination.path(["rev-parse", "--verify", "HEAD"])
         try destination.run(["read-tree", head])
         let entries = try tree(in: destination, commit: head)
@@ -84,9 +85,6 @@ struct TrackedCheckout {
         } catch let error as Git.Exit where error.status == 1 {
             // Matching entries were still refreshed; mismatched paths (e.g. collisions) are normal.
         }
-        try destination.runHook("post-checkout", arguments: [
-            String(repeating: "0", count: head.utf8.count), head, "1",
-        ])
         return .finished(cloned: cloned.count, checkedOut: remaining.count)
     }
 
