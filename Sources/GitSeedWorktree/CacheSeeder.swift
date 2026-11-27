@@ -13,6 +13,8 @@ enum CacheOutcome: Equatable {
 }
 
 struct CacheSeeder {
+    private static let blockingFlags = UInt32(UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND)
+
     let donor: String
     let destination: String
 
@@ -59,7 +61,7 @@ struct CacheSeeder {
         let stagingPath = destination + "/" + stagingName
         defer { try? FileManager.default.removeItem(atPath: stagingPath) }
         let staging = try destinationRoot.open(stagingName)
-        try staging.make("cache")
+        try staging.make("cache", mode: 0o777)
         let stagedCache = try staging.open("cache")
         var links = [String]()
         try cloneContents(source, into: stagedCache, device: device, prefix: "", links: &links)
@@ -73,7 +75,7 @@ struct CacheSeeder {
         let parent: Directory
         do {
             parent = try path.components.dropLast().reduce(destinationRoot) { parent, name in
-                try parent.openOrMake(name)
+                try parent.openOrMake(name, mode: 0o777)
             }
         } catch let error as FileError where error.code == ENOTDIR || error.code == ELOOP {
             return .skipped("the destination parent must contain real directories")
@@ -95,15 +97,20 @@ struct CacheSeeder {
                 throw FileError("inspect \(path)")
             }
             guard status.st_dev == device else { throw IneligibleCache("mount point at \(path)") }
-            let blockingFlags = UInt32(UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND)
-            guard status.st_flags & blockingFlags == 0 else { throw IneligibleCache("locked item at \(path)") }
+            guard status.st_flags & Self.blockingFlags == 0 else { throw IneligibleCache("locked item at \(path)") }
             switch status.st_mode & S_IFMT {
             case S_IFDIR:
-                try target.make(name)
-                try cloneContents(source.open(name), into: target.open(name), device: device,
+                let child = try source.open(name)
+                let childStatus = try child.status()
+                guard childStatus.st_dev == device else { throw IneligibleCache("mount point at \(path)") }
+                guard childStatus.st_flags & Self.blockingFlags == 0 else {
+                    throw IneligibleCache("locked item at \(path)")
+                }
+                try target.make(name, mode: 0o777)
+                try cloneContents(child, into: target.open(name), device: device,
                                   prefix: path + "/", links: &links)
             case S_IFREG:
-                try cloneFile(name, from: source, into: target, path: path)
+                try cloneFile(name, from: source, into: target, device: device, path: path)
             case S_IFLNK:
                 var bytes = [UInt8](repeating: 0, count: Int(PATH_MAX))
                 let count = readlinkat(source.fd, name, &bytes, bytes.count)
@@ -118,10 +125,18 @@ struct CacheSeeder {
         }
     }
 
-    private func cloneFile(_ name: String, from source: Directory, into target: Directory, path: String) throws {
+    private func cloneFile(_ name: String, from source: Directory, into target: Directory, device: dev_t,
+                           path: String) throws {
         let file = openat(source.fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard file >= 0 else { throw FileError("open \(path)") }
         defer { _ = close(file) }
+        var status = stat()
+        guard fstat(file, &status) == 0 else { throw FileError("inspect \(path)") }
+        guard status.st_dev == device else { throw IneligibleCache("mount point at \(path)") }
+        guard status.st_flags & Self.blockingFlags == 0 else { throw IneligibleCache("locked item at \(path)") }
+        guard status.st_mode & S_IFMT == S_IFREG else {
+            throw IneligibleCache("unsupported filesystem entry at \(path)")
+        }
         try target.clone(file, as: name, diagnosticPath: path)
     }
 }
@@ -163,8 +178,8 @@ final class Directory {
         return Directory(fd: child)
     }
 
-    func make(_ name: String) throws {
-        guard mkdirat(fd, name, 0o700) == 0 else { throw FileError("create directory \(name)") }
+    func make(_ name: String, mode: mode_t = 0o700) throws {
+        guard mkdirat(fd, name, mode) == 0 else { throw FileError("create directory \(name)") }
     }
 
     func openOrMake(_ name: String, mode: mode_t = 0o700) throws -> Directory {

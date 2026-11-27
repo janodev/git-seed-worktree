@@ -89,12 +89,13 @@ struct SeedWorktree: ParsableCommand {
         try git.run(arguments)
 
         let destinationPath = absolute(path, relativeTo: git.directory)
+        let destinationCaseSensitive = try volumeIsCaseSensitive(at: destinationPath)
         var destination = try git.independentWorktree(at: destinationPath)
         var tracked = standardReason.map(TrackedCheckoutOutcome.standard)
         if seedTrackedFiles {
-            tracked = try TrackedCheckout(donor: donor, destination: destination).finish()
+            tracked = try TrackedCheckout(donor: donor, destination: destination,
+                                          caseSensitive: destinationCaseSensitive).finish()
         }
-        let destinationCaseSensitive = try volumeIsCaseSensitive(at: destinationPath)
         let seeder = CacheSeeder(donor: donorRoot, destination: destinationPath)
         let outcomes = paths.map { path in
             (path.name, seeder.transfer(path) {
@@ -155,7 +156,7 @@ struct CachePath {
         }
     }
 
-    private static func comparisonKey(_ component: String) -> String {
+    static func comparisonKey(_ component: String) -> String {
         // Treat case and canonical Unicode aliases conservatively, including
         // when examining a Git index that was authored on another filesystem.
         component.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))

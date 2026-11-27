@@ -26,8 +26,8 @@ struct Git {
         try invoke(arguments, capture: true, input: input)
     }
 
-    func path(_ arguments: [String]) throws -> String {
-        let bytes = try invoke(arguments, capture: true)
+    func path(_ arguments: [String], input: Data? = nil) throws -> String {
+        let bytes = try invoke(arguments, capture: true, input: input)
         guard bytes.last == 0x0A, let value = String(data: bytes.dropLast(), encoding: .utf8), !value.isEmpty else {
             throw CocoaError(.fileReadInapplicableStringEncoding)
         }
@@ -56,6 +56,27 @@ struct Git {
         let entries = try indexedPaths ?? invoke(["ls-files", "-z"], capture: true).split(separator: 0)
         indexedPaths = entries
         return !entries.contains { path.containsIndexedPath($0, caseSensitive: caseSensitive) }
+    }
+
+    func runHook(_ name: String, arguments: [String]) throws {
+        // Execute hooks directly without GIT_DIR set (matching git worktree add),
+        // so hooks that inspect other repositories or submodules are not redirected.
+        let hookPath = try path(["rev-parse", "--git-path", "hooks/" + name])
+        let resolved = hookPath.hasPrefix("/") ? hookPath : directory + "/" + hookPath
+        var info = stat()
+        guard stat(resolved, &info) == 0, info.st_mode & S_IFMT == S_IFREG, access(resolved, X_OK) == 0 else {
+            return
+        }
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: resolved)
+        child.currentDirectoryURL = URL(fileURLWithPath: directory)
+        child.arguments = arguments
+        child.environment = environment
+        child.standardInput = FileHandle.nullDevice
+        try child.run()
+        child.waitUntilExit()
+        let status = child.terminationReason == .exit ? child.terminationStatus : 128 + child.terminationStatus
+        guard status == 0 else { throw Exit(arguments: ["hook", "run", name] + arguments, status: status) }
     }
 
     private func invoke(_ arguments: [String], capture: Bool, input: Data? = nil) throws -> Data {

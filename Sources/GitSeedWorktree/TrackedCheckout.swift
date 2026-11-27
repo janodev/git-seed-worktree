@@ -17,20 +17,35 @@ struct TrackedCheckoutFailure: Error, CustomStringConvertible {
 struct TrackedCheckout {
     let donor: Git
     let destination: Git
+    let caseSensitive: Bool
 
     static func standardCheckoutReason(invokedFrom git: Git, seed donor: Git) throws -> String? {
         let config: Data
         do {
-            config = try git.capture(["config", "--null", "--get-regexp",
+            config = try git.capture(["config", "--show-scope", "--null", "--get-regexp",
                 "^(core\\.sparsecheckout|core\\.autocrlf|submodule\\.recurse)$"])
         } catch let error as Git.Exit where error.status == 1 {
             return try hasDonorCommit(donor) ? nil : "the seed has no commit"
         }
-        for record in config.split(separator: 0) {
-            let fields = String(decoding: record, as: UTF8.self).split(separator: "\n", maxSplits: 1)
-            guard let key = fields.first else { continue }
-            let value = fields.count == 2 ? fields[1].lowercased() : "true"
-            if !["false", "no", "off", "0"].contains(value) { return "\(key) uses Git's standard checkout" }
+        guard config.isEmpty || config.last == 0 else { throw MalformedGitOutput(command: "config") }
+        let fields = config.split(separator: 0, omittingEmptySubsequences: false).dropLast()
+        guard fields.count.isMultiple(of: 2) else { throw MalformedGitOutput(command: "config") }
+        var effective = [String: String]()
+        for i in stride(from: 0, to: fields.count, by: 2) {
+            let scope = String(decoding: fields[i], as: UTF8.self)
+            let entry = String(decoding: fields[i + 1], as: UTF8.self).split(
+                separator: "\n", maxSplits: 1, omittingEmptySubsequences: false
+            )
+            guard let key = entry.first.map(String.init) else { continue }
+            // A new worktree does not inherit the invoking worktree's config.worktree,
+            // except that git worktree add propagates sparse-checkout from it.
+            if scope == "worktree" && key != "core.sparsecheckout" { continue }
+            effective[key] = entry.count == 2 ? entry[1].lowercased() : "true"
+        }
+        for key in ["core.sparsecheckout", "core.autocrlf", "submodule.recurse"] {
+            if let value = effective[key], !["", "false", "no", "off", "0"].contains(value) {
+                return "\(key) uses Git's standard checkout"
+            }
         }
         return try hasDonorCommit(donor) ? nil : "the seed has no commit"
     }
@@ -61,12 +76,17 @@ struct TrackedCheckout {
         let cloned = try cloneEntries(entries, source: source, target: target)
         let remaining = entries.filter { !cloned.contains($0.path) }
         if !remaining.isEmpty {
-            try destination.run(["checkout-index", "--index", "-z", "--stdin"],
+            try destination.run(["checkout-index", "-f", "--index", "-z", "--stdin"],
                                 input: pathList(remaining))
         }
-        try destination.run(["update-index", "-q", "--refresh"])
-        try destination.run(["hook", "run", "--ignore-missing", "post-checkout", "--",
-                             String(repeating: "0", count: head.utf8.count), head, "1"])
+        do {
+            try destination.run(["update-index", "-q", "--refresh"])
+        } catch let error as Git.Exit where error.status == 1 {
+            // Matching entries were still refreshed; mismatched paths (e.g. collisions) are normal.
+        }
+        try destination.runHook("post-checkout", arguments: [
+            String(repeating: "0", count: head.utf8.count), head, "1",
+        ])
         return .finished(cloned: cloned.count, checkedOut: remaining.count)
     }
 
@@ -76,7 +96,10 @@ struct TrackedCheckout {
 
         let sourceEntries = try tree(in: donor, commit: "HEAD")
         let sourceByPath = Dictionary(uniqueKeysWithValues: sourceEntries.map { ($0.path, $0) })
-        let candidates = entries.filter { $0.regular && sourceByPath[$0.path] == $0 }
+        let colliding = collidingPaths(entries)
+        let candidates = entries.filter {
+            $0.regular && !colliding.contains($0.path) && sourceByPath[$0.path] == $0
+        }
         guard !candidates.isEmpty else { return [] }
         let transformed = try pathsWithCheckoutConversion(candidates)
 
@@ -86,11 +109,45 @@ struct TrackedCheckout {
         let staging = try target.open(stagingName)
         var cloned = Set<Data>()
         for entry in candidates where !transformed.contains(entry.path) {
-            if try cloneEntry(entry, from: source, to: target, staging: staging, device: device) {
+            switch try cloneEntry(entry, from: source, to: target, staging: staging, device: device) {
+            case .cloned:
                 cloned.insert(entry.path)
+            case .fallback:
+                break
+            case .unsupportedVolume:
+                return cloned
             }
         }
         return cloned
+    }
+
+    private func collidingPaths(_ entries: [TreeEntry]) -> Set<Data> {
+        var fileOwners = [[String]: [Data]]()
+        var directoryPrefixes = Set<[String]>()
+        var normalized = [(Data, [String])]()
+        normalized.reserveCapacity(entries.count)
+        for entry in entries {
+            guard let name = String(data: entry.path, encoding: .utf8),
+                  let components = worktreePathComponents(name) else { continue }
+            let key = caseSensitive ? components : components.map(CachePath.comparisonKey)
+            normalized.append((entry.path, key))
+            fileOwners[key, default: []].append(entry.path)
+            for depth in 1..<key.count {
+                directoryPrefixes.insert(Array(key.prefix(depth)))
+            }
+        }
+        var result = Set<Data>()
+        for (path, key) in normalized {
+            if (fileOwners[key]?.count ?? 0) > 1 || directoryPrefixes.contains(key) {
+                result.insert(path)
+                continue
+            }
+            for depth in 1..<key.count where fileOwners[Array(key.prefix(depth))] != nil {
+                result.insert(path)
+                break
+            }
+        }
+        return result
     }
 
     private func tree(in git: Git, commit: String) throws -> [TreeEntry] {
@@ -98,7 +155,9 @@ struct TrackedCheckout {
     }
 
     private func pathsWithCheckoutConversion(_ candidates: [TreeEntry]) throws -> Set<Data> {
-        let output = try destination.capture(["check-attr", "--cached", "--all", "-z", "--stdin"],
+        // Omit --cached so attr.tree and GIT_ATTR_SOURCE are honored; when neither
+        // is set, Git falls back to the index while the worktree is still empty.
+        let output = try destination.capture(["check-attr", "--all", "-z", "--stdin"],
                                              input: pathList(candidates))
         guard output.isEmpty || output.last == 0 else { throw MalformedGitOutput(command: "check-attr") }
         let fields = output.split(separator: 0, omittingEmptySubsequences: false).dropLast()
@@ -119,37 +178,56 @@ struct TrackedCheckout {
         return result
     }
 
+    private enum CloneAttempt {
+        case cloned
+        case fallback
+        case unsupportedVolume
+    }
+
     private func cloneEntry(_ entry: TreeEntry, from source: Directory, to target: Directory,
-                            staging: Directory, device: dev_t) throws -> Bool {
+                            staging: Directory, device: dev_t) throws -> CloneAttempt {
         guard let name = String(data: entry.path, encoding: .utf8),
               let components = worktreePathComponents(name), let leaf = components.last,
-              let parent = try? components.dropLast().reduce(source, { try $0.open($1) }) else { return false }
+              let parent = try? components.dropLast().reduce(source, { try $0.open($1) }) else { return .fallback }
         let fd = openat(parent.fd, leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { return false }
+        guard fd >= 0 else { return .fallback }
         defer { _ = close(fd) }
         var info = stat()
         guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_dev == device,
-              info.st_flags == 0, hasOnlyCheckoutAttributes(fd) else { return false }
+              info.st_flags == 0, hasOnlyCheckoutAttributes(fd) else { return .fallback }
         do {
             try staging.clone(fd, as: "file", diagnosticPath: name)
+        } catch let error as FileError where error.code == ENOTSUP || error.code == EXDEV {
+            return .unsupportedVolume
         } catch is FileError {
             // Git can still write this entry from its object database.
-            return false
+            return .fallback
         }
         defer { _ = unlinkat(staging.fd, "file", 0) }
         let staged = openat(staging.fd, "file", O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard staged >= 0 else { throw FileError("open staged file \(name)") }
         let handle = FileHandle(fileDescriptor: staged, closeOnDealloc: true)
         guard fstat(staged, &info) == 0 else { throw FileError("inspect staged file \(name)") }
-        guard try entry.matches(handle, size: info.st_size) else { return false }
+        if info.st_flags != 0 {
+            _ = fchflags(staged, 0)
+            return .fallback
+        }
+        guard hasOnlyCheckoutAttributes(staged) else { return .fallback }
+        guard try entry.matches(handle, size: info.st_size) else { return .fallback }
 
         let permissions: mode_t = entry.mode == "100755" ? 0o777 : 0o666
         guard fchmod(staged, permissions & ~getumask()) == 0 else { throw FileError("set mode of \(name)") }
-        let destinationParent = try components.dropLast().reduce(target) { try $0.openOrMake($1, mode: 0o777) }
+        let destinationParent: Directory
+        do {
+            destinationParent = try components.dropLast().reduce(target) { try $0.openOrMake($1, mode: 0o777) }
+        } catch let error as FileError where error.code == ENOTDIR || error.code == ELOOP {
+            return .fallback
+        }
         guard renameatx_np(staging.fd, "file", destinationParent.fd, leaf, UInt32(RENAME_EXCL)) == 0 else {
+            if errno == EEXIST { return .fallback }
             throw FileError("publish tracked file \(name)")
         }
-        return true
+        return .cloned
     }
 
     private func hasOnlyCheckoutAttributes(_ file: Int32) -> Bool {
